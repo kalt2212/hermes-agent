@@ -136,3 +136,70 @@ def test_slack_fence_sits_on_its_own_line_so_the_commands_backticks_never_merge_
     assert text.splitlines().count(fence) == 2  # opener and closer each alone on a line
     shown = text.split(fence + "\n", 1)[1].rsplit("\n" + fence, 1)[0]
     assert shown.startswith("`" * 20) and max(map(len, re.findall("`+", shown))) == 20
+
+
+# ---- quoted heredoc collapse (#158342) ---------------------------------------------------------------------------
+
+
+def _heredoc_command(opener="cat > /tmp/body.md <<'EOF'", body_lines=300, terminator="EOF"):
+    body = "\n".join(f"line {i} of the issue body with some words" for i in range(body_lines))
+    return f"{opener}\n{body}\n{terminator}\ngh issue create -R owner/repo --body-file /tmp/body.md"
+
+
+def test_collapse_keeps_opener_terminator_and_tail_for_a_quoted_heredoc():
+    from gateway.platforms.base_exec_approval import collapse_quoted_heredocs
+
+    command = _heredoc_command()
+    assert collapse_quoted_heredocs(command) == (
+        "cat > /tmp/body.md <<'EOF'\n[heredoc: 300 lines collapsed]\nEOF\n"
+        "gh issue create -R owner/repo --body-file /tmp/body.md")
+
+
+@pytest.mark.parametrize("opener", ["cat > /tmp/b.md <<\"EOF\"", "tee /tmp/b.md <<'EOF' >/dev/null"])
+def test_collapse_accepts_double_quoted_delimiter_and_tee(opener):
+    from gateway.platforms.base_exec_approval import collapse_quoted_heredocs
+
+    assert "[heredoc: 300 lines collapsed]" in collapse_quoted_heredocs(_heredoc_command(opener=opener))
+
+
+@pytest.mark.parametrize("command", [
+    _heredoc_command(opener="cat > /tmp/b.md <<EOF"),  # unquoted: the shell expands the body
+    _heredoc_command(opener="bash <<'EOF'"),  # quoted, but the body is run as code, not data
+    _heredoc_command(opener="cat <<'EOF' | sh"),  # piped to a shell
+    _heredoc_command(opener="python3 <<'EOF'"),  # piped to an interpreter
+    "cat <<'EOF'\nrun $(whoami)\nEOF\ngh issue create",  # command substitution in the body
+    "cat <<'EOF'\nuse `date` here\nEOF\ngh issue create",  # backtick in the body
+    "cat <<'EOF'\nno terminator here\ngh issue create",  # unterminated: nothing to delimit
+])
+def test_collapse_leaves_unsafe_or_unterminated_heredocs_untouched(command):
+    from gateway.platforms.base_exec_approval import collapse_quoted_heredocs
+
+    assert collapse_quoted_heredocs(command) == command
+
+
+def test_collapse_handles_dash_heredoc_with_tab_indented_terminator():
+    from gateway.platforms.base_exec_approval import collapse_quoted_heredocs
+
+    command = "cat <<-'EOF'\n\tbody one\n\tbody two\n\tEOF\ngh issue create"
+    assert collapse_quoted_heredocs(command) == "cat <<-'EOF'\n[heredoc: 2 lines collapsed]\n\tEOF\ngh issue create"
+
+
+def test_collapse_is_a_no_op_for_commands_without_heredocs():
+    from gateway.platforms.base_exec_approval import collapse_quoted_heredocs
+
+    command = "echo hi && rm -rf /tmp/x"
+    assert collapse_quoted_heredocs(command) == command
+
+
+@pytest.mark.asyncio
+async def test_long_quoted_heredoc_card_shows_the_command_tail():
+    """The reported case: a 2 KB heredoc body used to push the gh call past the cut. Now the body is
+    collapsed, the tail is on the card, and the card still counts as cut (full command or Deny only)."""
+    adapter = _Chat()
+    command = _heredoc_command()
+    text = await _ask(adapter, command)
+    assert "[heredoc: 300 lines collapsed]" in text
+    assert "gh issue create -R owner/repo --body-file /tmp/body.md" in text
+    assert "line 150 of the issue body" not in text
+    assert adapter.sent == [f"```\n{command}\n```"]  # the whole command still goes out first
+    assert _choices(adapter) == ["once", "session", "always", "deny"]
