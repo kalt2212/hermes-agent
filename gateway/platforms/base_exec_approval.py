@@ -108,6 +108,39 @@ def fit_fenced(command: str, fit) -> tuple[str, str]:
     return shown, code_fence(shown)
 
 
+_HEREDOC_OPENER_RE = re.compile(r"<<(-?)[ \t]*(['\"])([A-Za-z_][A-Za-z0-9_]*)\2")
+# Only a heredoc that feeds cat/tee is data: a quoted body piped to a shell or interpreter is code.
+_DATA_HEREDOC_LINE_RE = re.compile(r"[ \t]*(?:cat|tee)\b[^|]*$")
+
+
+def collapse_quoted_heredocs(command: str) -> str:
+    """``command`` with the body of each quoted-delimiter heredoc that feeds cat/tee replaced by a line count.
+    The opener line and the terminator line stay, so the command tail after them stays visible. Unquoted
+    delimiters (the shell expands those), bodies with ``$(`` or a backtick, and pipes stay as they are."""
+    lines = command.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        openers = list(_HEREDOC_OPENER_RE.finditer(line))
+        if len(openers) != 1 or not _DATA_HEREDOC_LINE_RE.match(line):
+            i += 1
+            continue
+        strip_tabs = openers[0].group(1) == "-"
+        tag = openers[0].group(3)
+        end = next((j for j in range(i + 1, len(lines))
+                    if (lines[j].lstrip("\t") if strip_tabs else lines[j]) == tag), None)
+        body = lines[i + 1:end] if end is not None else []
+        if not body or any("$(" in b or "`" in b for b in body):
+            i += 1
+            continue
+        out.append(f"[heredoc: {len(body)} lines collapsed]")
+        out.append(lines[end])
+        i = end + 1
+    return "\n".join(out)
+
+
 # Shortest preview a hard-capped card keeps beside the cut notice; a longer reason is shortened to leave it.
 _EA_MIN_PREVIEW = 120
 
@@ -140,17 +173,20 @@ def render_exec_approval(adapter: Any, command: str, description: str, smart_den
     # A ``` inside the shown preview would close a markdown fence early; a longer fence holds it, and its
     # extra backticks come out of the preview budget.
     base = adapter._exec_approval_cmd_budget(description, smart_denied)
+    # Heredoc bodies are shown collapsed. ``truncated`` below still compares with the whole command, so a
+    # collapsed body counts as cut: the full command goes out first, or only Deny is offered.
+    shown = collapse_quoted_heredocs(command)
 
     def fit(fence: str) -> str:
         budget = base - 2 * (len(fence) - 3)
-        preview = adapter._ea_fit(command, budget)
-        if preview == command:
+        preview = adapter._ea_fit(shown, budget)
+        if preview == shown:
             return preview
         # The notice shares the cap the budget was sized for; a tiny fixed budget keeps half its preview.
         left = budget - adapter.message_len_fn(cut_notice)
-        return adapter._ea_fit(command, max(left, 0) if capped else max(left, budget // 2))
+        return adapter._ea_fit(shown, max(left, 0) if capped else max(left, budget // 2))
 
-    preview, fence = fit_fenced(command, fit)
+    preview, fence = fit_fenced(shown, fit)
     truncated = preview != command
     notice = cut_notice if truncated else ""
     code_open, code_close = (part.replace("```", fence, 1) for part in (adapter._EA_CODE_OPEN, adapter._EA_CODE_CLOSE))
